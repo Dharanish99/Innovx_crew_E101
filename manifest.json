@@ -1,0 +1,19 @@
+{
+    "manifest_version": 3,
+    "name": "AI Web Guide",
+    "version": "1.0",
+    "description": "An Agentic UX assistant to help navigate websites.",
+    "permissions": [
+        "activeTab"
+    ],
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "content.js"
+            ]
+        }
+    ]
+}
