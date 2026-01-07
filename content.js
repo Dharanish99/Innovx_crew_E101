@@ -12,6 +12,10 @@ class AgentSidebar {
         this.isTyping = false;
         this.demoMode = false;
         this.messageQueue = [];
+        // NEW: Mode and instance tracking
+        this.mode = 'steps'; // 'steps' or 'instructions'
+        this.instanceId = Math.random().toString(36).substring(2, 8); // Unique per tab
+        this.buttonCounter = 0; // For unique button IDs
         this.init();
     }
 
@@ -64,9 +68,9 @@ class AgentSidebar {
                     ${logoIcon}
                     <div class="header-info">
                         <span class="agent-title">Agentic UX</span>
-                        <div class="dev-toggle-wrapper">
-                            <span>Dev Mode</span>
-                            <div class="switch" id="dev-toggle"></div>
+                        <div class="mode-selector">
+                            <button class="mode-btn active" id="mode-steps">📍 Steps</button>
+                            <button class="mode-btn" id="mode-instructions">📝 Instructions</button>
                         </div>
                     </div>
                 </div>
@@ -114,12 +118,24 @@ class AgentSidebar {
             this.toggle(false);
         });
 
-        const devToggle = this.shadow.getElementById('dev-toggle');
-        devToggle.addEventListener('click', (e) => {
+        // Mode toggle handlers
+        const modeStepsBtn = this.shadow.getElementById('mode-steps');
+        const modeInstructionsBtn = this.shadow.getElementById('mode-instructions');
+
+        modeStepsBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            this.demoMode = !this.demoMode;
-            devToggle.classList.toggle('on', this.demoMode);
-            this.addMessage('agent', `Developer Logs: ${this.demoMode ? 'ON' : 'OFF'}`);
+            this.mode = 'steps';
+            modeStepsBtn.classList.add('active');
+            modeInstructionsBtn.classList.remove('active');
+            this.addMessage('agent', "📍 <b>Steps Mode</b>: I'll guide you step-by-step with visual highlights.");
+        });
+
+        modeInstructionsBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.mode = 'instructions';
+            modeInstructionsBtn.classList.add('active');
+            modeStepsBtn.classList.remove('active');
+            this.addMessage('agent', "📝 <b>Instructions Mode</b>: I'll give you detailed written instructions.");
         });
 
         const input = this.shadow.getElementById('agent-input');
@@ -128,7 +144,7 @@ class AgentSidebar {
         this.shadow.getElementById('send-btn').addEventListener('click', () => this.handleInput());
 
         this.shadow.getElementById('scan-trigger').addEventListener('click', () => {
-            this.scanAndAnalyze("Analyze this page and find productivity shortcuts");
+            this.scanAndAnalyze("Analyze this page and tell me what I can do here");
         });
     }
 
@@ -298,34 +314,337 @@ class AgentSidebar {
 
         const snapshot = snapshotDef || getCleanSnapshot();
 
-        chrome.runtime.sendMessage({
-            type: "ANALYZE_REQUEST",
-            payload: { userQuery: query, domSnapshot: snapshot }
-        }, (response) => {
-            this.setStatus('ready');
-            if (chrome.runtime.lastError) return;
+        chrome.runtime.sendMessage(
+            { type: "ANALYZE_REQUEST", payload: { userQuery: query, domSnapshot: snapshot } },
+            (response) => {
+                this.setStatus('ready');
 
-            if (this.demoMode) {
-                this.addMessage('agent', `<div class="debug-log">${JSON.stringify(response, null, 2)}</div>`, true);
+                if (chrome.runtime.lastError) {
+                    this.addMessage('agent', `❌ <b>System Error</b>: ${chrome.runtime.lastError.message}`);
+                    console.error("Agent Runtime Error:", chrome.runtime.lastError);
+                    return;
+                }
+
+                // Guard against missing response
+                if (!response) {
+                    this.addMessage('agent', "❌ <b>No response</b> from background – extension may have crashed.");
+                    console.warn("Empty response from background.");
+                    return;
+                }
+
+                if (this.demoMode) {
+                    this.addMessage('agent',
+                        `<div class="debug-log">${JSON.stringify(response, null, 2)}</div>`, true);
+                }
+
+                this.handlePlanResponse(response);
             }
-
-            this.handlePlanResponse(response);
-        });
+        );
     }
 
     handlePlanResponse(plan) {
-        const { roadmap, immediate_target_id, guidance_text, clarification_needed } = plan;
+        if (!plan) return;
+        if (plan.error) {
+            this.addMessage('agent', `❌ <b>Oops!</b> ${plan.message || 'Something went wrong. Please try again.'}`);
+            return;
+        }
+
+        const { roadmap, guidance_text, clarification_needed } = plan;
 
         if (clarification_needed) {
             this.addMessage('agent', `🤔 ${guidance_text}`);
-        } else {
-            this.renderStepper(roadmap, 0);
-            if (immediate_target_id) {
-                this.addPlan(roadmap[0].reasoning, immediate_target_id, roadmap[0].step_id);
-                this.addMessage('agent', guidance_text);
+        } else if (roadmap && roadmap.length > 0) {
+            this.currentRoadmap = roadmap;
+            this.currentStepIndex = 0;
+
+            // Different handling based on mode
+            if (this.mode === 'instructions') {
+                this.showInstructionsMode(roadmap);
             } else {
-                this.addMessage('agent', "Plan created. I'll guide you step-by-step.");
+                // Steps mode
+                this.addMessage('agent', `📋 <b>Got it!</b> I've created a ${roadmap.length}-step plan for you.`);
+                this.renderStepper(roadmap, 0);
+                this.showCurrentStep();
             }
+        } else {
+            this.addMessage('agent', guidance_text || "I looked at the page but I'm not sure what to do. Can you be more specific?");
+        }
+    }
+
+    // --- INSTRUCTIONS MODE: Text-only detailed guide ---
+    showInstructionsMode(roadmap) {
+        let instructionsHtml = `
+            <div class="plan-card" style="max-height: 400px; overflow-y: auto;">
+                <div class="plan-title">📝 Complete Instructions</div>
+                <div style="margin-top: 12px;">
+        `;
+
+        roadmap.forEach((step, index) => {
+            const actionLabel = this.formatAction(step.action);
+            instructionsHtml += `
+                <div style="padding: 12px; margin-bottom: 10px; background: ${index % 2 === 0 ? '#f8fafc' : '#fff'}; border-radius: 8px; border-left: 3px solid #6366f1;">
+                    <div style="font-weight: 700; color: #4338ca; margin-bottom: 6px;">Step ${index + 1}: ${actionLabel}</div>
+                    <div style="font-size: 14px; color: #1e293b; margin-bottom: 4px;"><b>What to do:</b> ${step.target_hint}</div>
+                    <div style="font-size: 13px; color: #64748b;">💡 ${step.reasoning}</div>
+                </div>
+            `;
+        });
+
+        instructionsHtml += `
+                </div>
+                <div style="margin-top: 12px; padding: 10px; background: #f0fdf4; border-radius: 8px; font-size: 13px; color: #166534;">
+                    ✨ Follow these steps in order. Take your time!
+                </div>
+            </div>
+        `;
+
+        this.addMessage('agent', instructionsHtml, true);
+    }
+
+    // --- STEPS MODE: Interactive step-by-step guidance ---
+    showCurrentStep() {
+        if (!this.currentRoadmap || this.currentStepIndex >= this.currentRoadmap.length) return;
+
+        const step = this.currentRoadmap[this.currentStepIndex];
+        const stepNum = this.currentStepIndex + 1;
+        const totalSteps = this.currentRoadmap.length;
+        const actionLabel = this.formatAction(step.action);
+
+        // Generate unique button IDs for this instance and step
+        this.buttonCounter++;
+        const showMeBtnId = `show-${this.instanceId}-${this.buttonCounter}`;
+        const doneBtnId = `done-${this.instanceId}-${this.buttonCounter}`;
+
+        const html = `
+            <div class="plan-card">
+                <div class="plan-title">📍 Step ${stepNum} of ${totalSteps}</div>
+                <div style="margin: 10px 0; line-height: 1.7; font-size: 14px;">
+                    <div style="margin-bottom: 8px;">
+                        <span style="background: #e0e7ff; color: #4338ca; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">${actionLabel}</span>
+                    </div>
+                    <div style="font-size: 15px; font-weight: 500; color: #1e293b;">${step.target_hint}</div>
+                    <div style="font-size: 13px; color: #64748b; margin-top: 6px;">💡 ${step.reasoning}</div>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="action-btn" id="${showMeBtnId}" style="flex: 1; background: #f0f4ff; color: #4338ca;">🔍 Show me</button>
+                    <button class="action-btn" id="${doneBtnId}" style="flex: 2;">✓ Done - Next</button>
+                </div>
+            </div>
+        `;
+        this.addMessage('agent', html, true);
+
+        // Bind with unique IDs (setTimeout ensures DOM is ready)
+        setTimeout(() => {
+            const showMeBtn = this.shadow.getElementById(showMeBtnId);
+            const doneBtn = this.shadow.getElementById(doneBtnId);
+
+            if (showMeBtn) {
+                showMeBtn.onclick = () => this.highlightCurrentTarget();
+            }
+
+            if (doneBtn) {
+                doneBtn.onclick = () => {
+                    doneBtn.innerText = "✓ Done!";
+                    doneBtn.disabled = true;
+                    doneBtn.style.background = "#10b981";
+                    this.clearHighlight();
+                    this.advanceStep();
+                };
+            }
+        }, 50);
+
+        // Auto-highlight the target
+        this.highlightCurrentTarget();
+    }
+
+    highlightCurrentTarget() {
+        if (!this.currentRoadmap || this.currentStepIndex >= this.currentRoadmap.length) return;
+
+        const step = this.currentRoadmap[this.currentStepIndex];
+        let element = null;
+
+        // 1. Try to find by exact ID from LLM (most accurate)
+        if (step.target_id) {
+            element = document.querySelector(`[data-agent-id="${step.target_id}"]`);
+        }
+
+        // 2. Fall back to text-based search if ID not found
+        if (!element && step.target_hint) {
+            element = this.findElementByHint(step.target_hint);
+        }
+
+        if (element) {
+            this.highlightElement(element);
+        } else {
+            this.showToast("Element not visible. Look for: " + step.target_hint);
+        }
+    }
+
+    findElementByHint(hint) {
+        if (!hint) return null;
+
+        const searchTerms = hint.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+        const selectors = 'a, button, input, select, textarea, [role="button"], label, [onclick]';
+        const elements = document.querySelectorAll(selectors);
+
+        let bestMatch = null;
+        let bestScore = 0;
+
+        for (const el of elements) {
+            // Skip hidden elements
+            if (el.offsetParent === null && el.type !== 'hidden') continue;
+
+            // Get searchable text
+            const text = (el.innerText || el.placeholder || el.ariaLabel || el.name || el.value || '').toLowerCase();
+
+            // Calculate match score
+            let score = 0;
+            for (const term of searchTerms) {
+                if (text.includes(term)) score += 10;
+            }
+
+            // Bonus for exact matches
+            if (text.includes(hint.toLowerCase())) score += 50;
+
+            // Bonus for visible, interactive elements
+            if (el.tagName === 'BUTTON' || el.tagName === 'A' || el.type === 'submit') score += 5;
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = el;
+            }
+        }
+
+        return bestMatch;
+    }
+
+    highlightElement(element) {
+        // Clear any existing highlight
+        this.clearHighlight();
+
+        // Scroll element into view
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+        // Create highlight overlay
+        const rect = element.getBoundingClientRect();
+        const overlay = document.createElement('div');
+        overlay.id = 'agent-highlight-overlay';
+        overlay.innerHTML = `
+            <div class="agent-highlight-box"></div>
+            <div class="agent-highlight-label">Here!</div>
+        `;
+
+        // Inject styles if not already present
+        if (!document.getElementById('agent-highlight-styles')) {
+            const style = document.createElement('style');
+            style.id = 'agent-highlight-styles';
+            style.textContent = `
+                #agent-highlight-overlay {
+                    position: fixed;
+                    pointer-events: none;
+                    z-index: 2147483647;
+                    transition: all 0.3s ease;
+                }
+                .agent-highlight-box {
+                    position: absolute;
+                    border: 3px solid #6366f1;
+                    border-radius: 8px;
+                    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.3), 0 0 20px rgba(99, 102, 241, 0.4);
+                    animation: agent-pulse 1.5s ease-in-out infinite;
+                }
+                .agent-highlight-label {
+                    position: absolute;
+                    top: -35px;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+                    color: white;
+                    padding: 6px 14px;
+                    border-radius: 20px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
+                    white-space: nowrap;
+                }
+                @keyframes agent-pulse {
+                    0%, 100% { box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.3), 0 0 20px rgba(99, 102, 241, 0.4); }
+                    50% { box-shadow: 0 0 0 8px rgba(99, 102, 241, 0.2), 0 0 30px rgba(99, 102, 241, 0.6); }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        document.body.appendChild(overlay);
+
+        // Position the overlay
+        const updatePosition = () => {
+            const r = element.getBoundingClientRect();
+            overlay.style.top = (r.top - 4) + 'px';
+            overlay.style.left = (r.left - 4) + 'px';
+
+            const box = overlay.querySelector('.agent-highlight-box');
+            box.style.width = (r.width + 8) + 'px';
+            box.style.height = (r.height + 8) + 'px';
+        };
+        updatePosition();
+
+        // Update position on scroll/resize
+        this.highlightUpdateHandler = updatePosition;
+        window.addEventListener('scroll', updatePosition, true);
+        window.addEventListener('resize', updatePosition);
+
+        // Auto-remove after 10 seconds
+        this.highlightTimeout = setTimeout(() => this.clearHighlight(), 10000);
+    }
+
+    clearHighlight() {
+        const overlay = document.getElementById('agent-highlight-overlay');
+        if (overlay) overlay.remove();
+
+        if (this.highlightUpdateHandler) {
+            window.removeEventListener('scroll', this.highlightUpdateHandler, true);
+            window.removeEventListener('resize', this.highlightUpdateHandler);
+        }
+
+        if (this.highlightTimeout) {
+            clearTimeout(this.highlightTimeout);
+        }
+    }
+
+    formatAction(action) {
+        const actions = {
+            'click': '👆 Click',
+            'type': '⌨️ Type',
+            'scroll': '📜 Scroll',
+            'wait': '⏳ Wait',
+            'navigate': '🔗 Go to',
+            'select': '📋 Select',
+            'check': '☑️ Check'
+        };
+        return actions[action?.toLowerCase()] || `▶️ ${action || 'Do'}`;
+    }
+
+    advanceStep() {
+        this.currentStepIndex++;
+
+        if (this.currentStepIndex < this.currentRoadmap.length) {
+            this.renderStepper(this.currentRoadmap, this.currentStepIndex);
+            this.showToast(`Step ${this.currentStepIndex} done! Moving to next...`);
+            this.showCurrentStep();
+
+            // Update backend state
+            chrome.runtime.sendMessage({ type: "UPDATE_STEP", payload: this.currentStepIndex });
+        } else {
+            this.clearHighlight();
+            this.addMessage('agent', "🎉 <b>Awesome!</b> You've completed all the steps. Great job!");
+            this.showToast("All done!");
+
+            // Clear stepper
+            const stepper = this.shadow.querySelector('.stepper-container');
+            if (stepper) stepper.remove();
+
+            // Reset state
+            chrome.runtime.sendMessage({ type: "RESET_TASK" });
         }
     }
 
@@ -333,91 +652,56 @@ class AgentSidebar {
         const existing = this.shadow.querySelector('.stepper-container');
         if (existing) existing.remove();
 
+        if (!roadmap || roadmap.length === 0) return;
+
         const stepperDetails = document.createElement('div');
         stepperDetails.className = 'stepper-container';
-        stepperDetails.style.padding = '10px 16px';
-        stepperDetails.style.background = 'rgba(0,0,0,0.02)';
-        stepperDetails.style.borderBottom = '1px solid var(--glass-border)';
+        stepperDetails.style.cssText = 'padding: 12px 16px; background: linear-gradient(135deg, #f0f4ff 0%, #e8f0fe 100%); border-bottom: 1px solid #c7d2fe;';
+
         stepperDetails.innerHTML = `
-            <div style="font-size:11px; font-weight:700; color:var(--primary-color); text-transform:uppercase; margin-bottom:4px;">
-                Mission Progress: Step ${currentStepIndex + 1}/${roadmap.length}
+            <div style="font-size: 11px; font-weight: 700; color: #4338ca; text-transform: uppercase; letter-spacing: 0.5px;">
+                Progress: Step ${currentStepIndex + 1} of ${roadmap.length}
             </div>
-            <div style="display:flex; gap:4px; height:4px; margin-top:4px;">
-                ${roadmap.map((step, i) => `
-                    <div style="flex:1; border-radius:2px; background: ${i <= currentStepIndex ? 'var(--primary-color)' : '#e2e8f0'}"></div>
-                `).join('')}
-            </div>
-            <div style="font-size:12px; margin-top:6px; color:var(--text-main);">
-                Current: <b>${roadmap[currentStepIndex].action} ${roadmap[currentStepIndex].target_hint}</b>
+            <div style="display: flex; gap: 4px; height: 6px; margin-top: 8px; background: #e2e8f0; border-radius: 3px; overflow: hidden;">
+                <div style="width: ${((currentStepIndex + 1) / roadmap.length) * 100}%; background: linear-gradient(90deg, #6366f1, #8b5cf6); border-radius: 3px; transition: width 0.3s ease;"></div>
             </div>
         `;
         const header = this.shadow.querySelector('.sidebar-header');
         header.insertAdjacentElement('afterend', stepperDetails);
     }
-
-    addPlan(reasoning, targetId, stepId) {
-        const html = `
-            <div class="plan-card">
-                <div class="plan-title">Step Logic</div>
-                <div>${reasoning}</div>
-                ${targetId ? `<button class="action-btn" data-target="${targetId}">Confirm & Execute</button>` : ''}
-            </div>
-        `;
-        this.addMessage('agent', html, true);
-
-        const btn = this.shadow.querySelector(`button[data-target="${targetId}"]`);
-        if (btn) {
-            btn.addEventListener('click', () => {
-                this.executeAction(targetId);
-                btn.innerText = "Executing...";
-                btn.disabled = true;
-                chrome.runtime.sendMessage({ type: "UPDATE_STEP", payload: stepId });
-                this.showToast(`Step ${stepId} Completed!`);
-            });
-        }
-    }
-
-    executeAction(targetId) {
-        const success = smoothFocus(targetId);
-        if (!success) this.addMessage('agent', "⚠️ Element lost. Rescan required.");
-    }
-
     setStatus(state) {
         const dot = this.shadow.getElementById('status-dot');
-        dot.className = `status-dot ${state}`;
+        if (dot) dot.className = `status-dot ${state}`;
     }
 
+    // --- PERSISTENCE: Remember mission across page loads ---
     async restoreState() {
         chrome.runtime.sendMessage({ type: "GET_STATE" }, (state) => {
-            if (state && state.isActive && state.roadmap) {
+            if (chrome.runtime.lastError) return;
+
+            if (state && state.isActive && state.roadmap && state.roadmap.length > 0) {
                 this.toggle(true);
-                this.renderStepper(state.roadmap, state.currentStep);
+                this.currentRoadmap = state.roadmap;
+                this.currentStepIndex = state.currentStep || 0;
 
-                // --- CONTINUITY ENGINE ---
-                const current = state.roadmap[state.currentStep];
-                if (current) {
-                    this.addMessage('agent', `🔄 <b>Page Refreshed</b>. Resuming Step ${state.currentStep + 1}: ${current.action} ${current.target_hint}...`);
-
-                    // Auto-Trigger Scan specifically to find the next target
-                    // We artificially inject the query to "find" the next step
-                    this.scanAndAnalyze(`Strictly find the element for this step: ${current.target_hint}. Reason: ${current.reasoning}`);
+                if (this.currentStepIndex < this.currentRoadmap.length) {
+                    this.addMessage('agent', `🔄 <b>Welcome back!</b> Continuing from Step ${this.currentStepIndex + 1} of ${state.roadmap.length}.`);
+                    this.addMessage('agent', `🎯 Goal: <b>${state.goal}</b>`);
+                    this.renderStepper(state.roadmap, this.currentStepIndex);
+                    this.showCurrentStep();
                 }
             }
         });
     }
 
     guideNextStep() {
-        // Trigger highlight for current step if available
-        chrome.runtime.sendMessage({ type: "GET_STATE" }, (state) => {
-            if (state && state.roadmap) {
-                this.addMessage('agent', `Guiding to: ${state.roadmap[state.currentStep].target_hint}`);
-                // In a real scenario, we'd need to re-find the ID or have a robust way to map the hint to the DOM
-                // This requires re-scan if ID is stale.
-                this.scanAndAnalyze(`Find the ${state.roadmap[state.currentStep].target_hint} button`);
-            } else {
-                this.addMessage('agent', "No active plan to guide.");
-            }
-        });
+        if (this.currentRoadmap && this.currentStepIndex < this.currentRoadmap.length) {
+            const step = this.currentRoadmap[this.currentStepIndex];
+            const actionLabel = this.formatAction(step.action);
+            this.addMessage('agent', `👉 Current: <b>${actionLabel}</b> ${step.target_hint}`);
+        } else {
+            this.addMessage('agent', "No active mission. Ask me something to get started!");
+        }
     }
 }
 
