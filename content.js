@@ -1,5 +1,5 @@
-// --- CONFIGURATION ---
-const GROQ_API_KEY = "YourGroqAPIKey"; // ⚠️ REPLACE THIS
+
+const GROQ_API_KEY = "YourGroqAPIKey";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 // --- AGENT INTERFACE V4 (Elite UX) ---
@@ -83,13 +83,17 @@ class AgentSidebar {
             <!-- Chat Stream -->
             <div class="sidebar-content" id="chat-stream">
                 <div class="chat-bubble agent">
-                    Ready to help. (Alt+S to Scan)
+                    👋 Ready to help! Press <b>Alt+S</b> to scan this page.
+                </div>
+                <div class="chat-bubble agent" style="background: linear-gradient(135deg, #f0fdf4, #dcfce7); border-left: 3px solid #22c55e;">
+                    🔐 <b>Your safety first:</b> I will never submit forms or interact with sensitive fields like passwords. You stay in control.
                 </div>
             </div>
 
             <!-- Footer -->
             <div class="sidebar-footer">
                 <button class="scan-btn" id="scan-trigger" title="Quick Scan">${scanIcon}</button>
+                <button class="scan-btn" id="perception-toggle" title="How I see this page" style="font-size: 14px;">👁️</button>
                 <div class="input-group">
                     <input type="text" class="chat-input" id="agent-input" placeholder="Ask or Alt+S...">
                     <span class="send-icon" id="send-btn">${sendIcon}</span>
@@ -145,6 +149,10 @@ class AgentSidebar {
 
         this.shadow.getElementById('scan-trigger').addEventListener('click', () => {
             this.scanAndAnalyze("Analyze this page and tell me what I can do here");
+        });
+
+        this.shadow.getElementById('perception-toggle').addEventListener('click', () => {
+            this.showPerceptionPanel();
         });
     }
 
@@ -349,7 +357,12 @@ class AgentSidebar {
             return;
         }
 
-        const { roadmap, guidance_text, clarification_needed } = plan;
+        const { roadmap, guidance_text, clarification_needed, page_description } = plan;
+
+        // Show structured page description if present
+        if (page_description) {
+            this.displayPageDescription(page_description);
+        }
 
         if (clarification_needed) {
             this.addMessage('agent', `🤔 ${guidance_text}`);
@@ -366,9 +379,55 @@ class AgentSidebar {
                 this.renderStepper(roadmap, 0);
                 this.showCurrentStep();
             }
-        } else {
+        } else if (!page_description) {
             this.addMessage('agent', guidance_text || "I looked at the page but I'm not sure what to do. Can you be more specific?");
         }
+    }
+
+    displayPageDescription(desc) {
+        let html = `
+            <div class="plan-card" style="max-height: 350px; overflow-y: auto;">
+                <div class="plan-title">📄 Page Overview</div>
+                <div style="margin: 10px 0; font-size: 14px; color: #1e293b; line-height: 1.6;">
+                    ${desc.overview || 'This page appears to contain interactive content.'}
+                </div>
+        `;
+
+        if (desc.main_sections && desc.main_sections.length > 0) {
+            html += `
+                <div style="margin-top: 12px;">
+                    <div style="font-weight: 600; color: #4338ca; font-size: 13px; margin-bottom: 6px;">📑 Main Sections</div>
+                    <ol style="margin: 0; padding-left: 20px; font-size: 13px; color: #374151;">
+                        ${desc.main_sections.map(s => `<li style="margin-bottom: 4px;">${s}</li>`).join('')}
+                    </ol>
+                </div>
+            `;
+        }
+
+        if (desc.interactive_elements && desc.interactive_elements.length > 0) {
+            html += `
+                <div style="margin-top: 12px;">
+                    <div style="font-weight: 600; color: #4338ca; font-size: 13px; margin-bottom: 6px;">🎛️ Interactive Elements</div>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #374151;">
+                        ${desc.interactive_elements.map(e => `<li style="margin-bottom: 4px;">${e}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        if (desc.forms_available && desc.forms_available.length > 0) {
+            html += `
+                <div style="margin-top: 12px;">
+                    <div style="font-weight: 600; color: #4338ca; font-size: 13px; margin-bottom: 6px;">📝 Forms Available</div>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #374151;">
+                        ${desc.forms_available.map(f => `<li style="margin-bottom: 4px;">${f}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        html += `</div>`;
+        this.addMessage('agent', html, true);
     }
 
     // --- INSTRUCTIONS MODE: Text-only detailed guide ---
@@ -457,38 +516,209 @@ class AgentSidebar {
         this.highlightCurrentTarget();
     }
 
+    // --- CONFIDENCE-AWARE ELEMENT RESOLUTION ---
+
     highlightCurrentTarget() {
         if (!this.currentRoadmap || this.currentStepIndex >= this.currentRoadmap.length) return;
 
         const step = this.currentRoadmap[this.currentStepIndex];
-        let element = null;
+        const result = this.resolveTargetElement(step);
 
-        // 1. Try to find by exact ID from LLM (most accurate)
-        if (step.target_id) {
-            element = document.querySelector(`[data-agent-id="${step.target_id}"]`);
+        // SAFETY: Handle blocked actions first
+        if (result.blocked) {
+            this.addMessage('agent', `
+                <div style="background: linear-gradient(135deg, #fef2f2, #fee2e2); border-left: 3px solid #ef4444; padding: 12px; border-radius: 8px;">
+                    <div style="font-weight: 700; color: #dc2626; margin-bottom: 6px;">🔐 Protected Action</div>
+                    <div style="font-size: 13px; color: #7f1d1d;">${result.blockedReason}</div>
+                </div>
+            `, true);
+            return;
         }
 
-        // 2. Fall back to text-based search if ID not found
-        if (!element && step.target_hint) {
-            element = this.findElementByHint(step.target_hint);
-        }
-
-        if (element) {
-            this.highlightElement(element);
+        // Handle based on confidence level
+        if (result.confidence >= 0.7) {
+            this.highlightElement(result.element);
+        } else if (result.confidence >= 0.3) {
+            this.highlightElement(result.element);
+            this.addMessage('agent', `💡 I found something that looks right. Please verify this is: <b>${step.target_hint}</b>`, true);
         } else {
-            this.showToast("Element not visible. Look for: " + step.target_hint);
+            // GUIDED DISCOVERY MODE - No technical errors, suggest navigation
+            this.enterGuidedDiscoveryMode(step);
+        }
+
+        // Handle multiple candidates warning
+        if (result.multipleMatches && result.confidence >= 0.3) {
+            this.addMessage('agent', `ℹ️ I see a few similar options. The highlighted one might be what you need, but double-check!`, true);
         }
     }
 
-    findElementByHint(hint) {
-        if (!hint) return null;
+    // --- GUIDED DISCOVERY MODE ---
+    enterGuidedDiscoveryMode(step) {
+        const discovery = this.analyzeNavigationOptions();
+
+        // Build helpful suggestion message
+        let message = `<div style="background: linear-gradient(135deg, #fefce8, #fef9c3); border-left: 3px solid #eab308; padding: 12px; border-radius: 8px;">`;
+        message += `<div style="font-weight: 700; color: #854d0e; margin-bottom: 8px;">🧭 Let me help you find it</div>`;
+        message += `<div style="font-size: 13px; color: #713f12; margin-bottom: 10px;">`;
+        message += `Looking for: <b>${step.target_hint}</b>`;
+        message += `</div>`;
+
+        if (discovery.suggestedPaths.length > 0) {
+            message += `<div style="font-size: 13px; color: #713f12;">Try checking:</div>`;
+            message += `<div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px;">`;
+            discovery.suggestedPaths.forEach(path => {
+                message += `<span style="background: #fef3c7; border: 1px solid #fcd34d; padding: 4px 10px; border-radius: 12px; font-size: 12px; color: #92400e;">${path}</span>`;
+            });
+            message += `</div>`;
+        }
+
+        if (discovery.mainMenu) {
+            message += `<div style="margin-top: 10px; font-size: 12px; color: #a16207;">💡 The main menu at the top might have what you need.</div>`;
+        }
+
+        message += `</div>`;
+
+        this.addMessage('agent', message, true);
+
+        // Try to highlight the navigation area
+        if (discovery.navElement) {
+            this.highlightElement(discovery.navElement);
+        }
+    }
+
+    analyzeNavigationOptions() {
+        const result = {
+            suggestedPaths: [],
+            mainMenu: null,
+            navElement: null
+        };
+
+        // Find navigation elements
+        const navSelectors = 'nav, [role="navigation"], header, .navbar, .nav, .menu, .sidebar';
+        const navElements = document.querySelectorAll(navSelectors);
+
+        if (navElements.length > 0) {
+            result.navElement = navElements[0];
+            result.mainMenu = true;
+        }
+
+        // Extract menu item labels
+        const menuItems = document.querySelectorAll('nav a, header a, .nav a, .menu a, [role="menuitem"]');
+        const seenLabels = new Set();
+
+        menuItems.forEach(item => {
+            const text = (item.innerText || '').trim();
+            if (text && text.length > 1 && text.length < 30 && !seenLabels.has(text.toLowerCase())) {
+                seenLabels.add(text.toLowerCase());
+                // Prioritize likely navigation items
+                const keywords = ['home', 'services', 'products', 'account', 'profile', 'settings',
+                    'help', 'support', 'contact', 'about', 'dashboard', 'menu',
+                    'register', 'sign', 'login', 'create', 'new', 'apply'];
+                if (keywords.some(k => text.toLowerCase().includes(k))) {
+                    result.suggestedPaths.unshift(text);
+                } else if (result.suggestedPaths.length < 5) {
+                    result.suggestedPaths.push(text);
+                }
+            }
+        });
+
+        // Limit suggestions
+        result.suggestedPaths = result.suggestedPaths.slice(0, 4);
+
+        // If no menu items found, look for headings
+        if (result.suggestedPaths.length === 0) {
+            const headings = document.querySelectorAll('h1, h2, h3');
+            headings.forEach(h => {
+                const text = (h.innerText || '').trim();
+                if (text && text.length < 40 && result.suggestedPaths.length < 3) {
+                    result.suggestedPaths.push(`"${text}" section`);
+                }
+            });
+        }
+
+        return result;
+    }
+
+    resolveTargetElement(step) {
+        let element = null;
+        let confidence = 0;
+        let reason = '';
+        let multipleMatches = false;
+        let blocked = false;
+        let blockedReason = '';
+
+        // 1. Try exact ID match (highest confidence)
+        if (step.target_id) {
+            element = document.querySelector(`[data-agent-id="${step.target_id}"]`);
+            if (element) {
+                // SAFETY CHECK: Block sensitive fields
+                if (element.type === 'password') {
+                    return {
+                        element: null,
+                        confidence: 0,
+                        reason: 'Sensitive field detected',
+                        multipleMatches: false,
+                        blocked: true,
+                        blockedReason: 'This is a password field. For your security, I cannot interact with it directly. Please enter your password manually.'
+                    };
+                }
+
+                // Verify element is visible
+                if (element.offsetParent !== null || element.type === 'hidden') {
+                    confidence = 1.0;
+                    reason = 'Exact ID match';
+                    return { element, confidence, reason, multipleMatches, blocked, blockedReason };
+                } else {
+                    confidence = 0.5;
+                    reason = 'ID found but element may be hidden';
+                }
+            }
+        }
+
+        // 2. Fall back to text-based search
+        if (confidence < 0.7 && step.target_hint) {
+            const searchResult = this.findElementsByHint(step.target_hint);
+
+            if (searchResult.matches.length === 1) {
+                element = searchResult.matches[0].element;
+
+                // SAFETY CHECK: Block sensitive fields
+                if (element.type === 'password') {
+                    return {
+                        element: null,
+                        confidence: 0,
+                        reason: 'Sensitive field detected',
+                        multipleMatches: false,
+                        blocked: true,
+                        blockedReason: 'This is a password field. For your security, I cannot interact with it directly. Please enter your password manually.'
+                    };
+                }
+
+                confidence = Math.min(searchResult.matches[0].score / 100, 1.0);
+                reason = 'Single text match';
+            } else if (searchResult.matches.length > 1) {
+                element = searchResult.matches[0].element;
+                confidence = Math.min(searchResult.matches[0].score / 150, 0.6);
+                reason = 'Multiple candidates found';
+                multipleMatches = true;
+            } else {
+                element = null;
+                confidence = 0;
+                reason = 'No matching elements found';
+            }
+        }
+
+        return { element, confidence, reason, multipleMatches };
+    }
+
+    findElementsByHint(hint) {
+        if (!hint) return { matches: [] };
 
         const searchTerms = hint.toLowerCase().split(/\s+/).filter(t => t.length > 2);
         const selectors = 'a, button, input, select, textarea, [role="button"], label, [onclick]';
         const elements = document.querySelectorAll(selectors);
 
-        let bestMatch = null;
-        let bestScore = 0;
+        const matches = [];
 
         for (const el of elements) {
             // Skip hidden elements
@@ -509,13 +739,16 @@ class AgentSidebar {
             // Bonus for visible, interactive elements
             if (el.tagName === 'BUTTON' || el.tagName === 'A' || el.type === 'submit') score += 5;
 
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = el;
+            // Only include if score > 0
+            if (score > 0) {
+                matches.push({ element: el, score, text: text.substring(0, 50) });
             }
         }
 
-        return bestMatch;
+        // Sort by score descending
+        matches.sort((a, b) => b.score - a.score);
+
+        return { matches };
     }
 
     highlightElement(element) {
@@ -702,6 +935,137 @@ class AgentSidebar {
         } else {
             this.addMessage('agent', "No active mission. Ask me something to get started!");
         }
+    }
+
+    // --- PERCEPTION TRANSPARENCY ---
+    showPerceptionPanel() {
+        const perception = this.analyzePagePerception();
+
+        // Build collapsible panel HTML
+        const panelId = `perception-${this.instanceId}`;
+        const html = `
+            <div class="perception-panel" id="${panelId}">
+                <div class="perception-header" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
+                    <span style="font-weight: 700; color: #4338ca;">👁️ How I See This Page</span>
+                    <span class="perception-toggle-icon" style="font-size: 12px;">▼</span>
+                </div>
+                <div class="perception-content" style="margin-top: 10px;">
+                    <div style="font-size: 14px; font-weight: 600; color: #1e293b; margin-bottom: 8px;">
+                        ${perception.summary}
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;">
+                        <div style="background: #f0f4ff; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 20px; font-weight: 700; color: #4338ca;">${perception.buttonCount}</div>
+                            <div style="font-size: 11px; color: #64748b;">Buttons</div>
+                        </div>
+                        <div style="background: #f0fdf4; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 20px; font-weight: 700; color: #16a34a;">${perception.inputCount}</div>
+                            <div style="font-size: 11px; color: #64748b;">Input Fields</div>
+                        </div>
+                        <div style="background: #fef3c7; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 20px; font-weight: 700; color: #d97706;">${perception.linkCount}</div>
+                            <div style="font-size: 11px; color: #64748b;">Links</div>
+                        </div>
+                        <div style="background: #fce7f3; padding: 8px; border-radius: 6px; text-align: center;">
+                            <div style="font-size: 20px; font-weight: 700; color: #db2777;">${perception.formCount}</div>
+                            <div style="font-size: 11px; color: #64748b;">Forms</div>
+                        </div>
+                    </div>
+                    ${perception.actions.length > 0 ? `
+                        <div style="margin-top: 12px;">
+                            <div style="font-size: 11px; color: #64748b; margin-bottom: 4px;">Detected Actions:</div>
+                            <div style="display: flex; flex-wrap: wrap; gap: 4px;">
+                                ${perception.actions.map(a => `<span style="background: #e0e7ff; color: #4338ca; padding: 2px 8px; border-radius: 10px; font-size: 11px;">${a}</span>`).join('')}
+                            </div>
+                        </div>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+
+        this.addMessage('agent', html, true);
+
+        // Make panel collapsible
+        setTimeout(() => {
+            const panel = this.shadow.getElementById(panelId);
+            if (panel) {
+                const header = panel.querySelector('.perception-header');
+                const content = panel.querySelector('.perception-content');
+                const icon = panel.querySelector('.perception-toggle-icon');
+
+                header.onclick = () => {
+                    const isHidden = content.style.display === 'none';
+                    content.style.display = isHidden ? 'block' : 'none';
+                    icon.textContent = isHidden ? '▼' : '▶';
+                };
+            }
+        }, 50);
+    }
+
+    analyzePagePerception() {
+        // Gather page info
+        const title = document.title || 'Untitled Page';
+        const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]');
+        const inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
+        const links = document.querySelectorAll('a[href]');
+        const forms = document.querySelectorAll('form');
+
+        // Detect page type
+        let pageType = 'page';
+        if (forms.length > 0 && inputs.length > 3) pageType = 'form';
+        else if (document.querySelectorAll('table, [role="grid"]').length > 0) pageType = 'list or table';
+        else if (document.querySelectorAll('[class*="dashboard"], [class*="panel"], [class*="widget"]').length > 0) pageType = 'dashboard';
+        else if (inputs.length > 0) pageType = 'interactive page';
+
+        // Detect common actions by button/link text
+        const actionKeywords = {
+            'submit': 'Submit', 'save': 'Save', 'create': 'Create', 'add': 'Add',
+            'delete': 'Delete', 'remove': 'Remove', 'edit': 'Edit', 'update': 'Update',
+            'search': 'Search', 'filter': 'Filter', 'login': 'Login', 'sign in': 'Sign In',
+            'register': 'Register', 'sign up': 'Sign Up', 'checkout': 'Checkout',
+            'buy': 'Buy', 'download': 'Download', 'upload': 'Upload', 'send': 'Send'
+        };
+
+        const detectedActions = new Set();
+        const allInteractive = [...buttons, ...links];
+        allInteractive.forEach(el => {
+            const text = (el.innerText || el.value || '').toLowerCase();
+            for (const [key, label] of Object.entries(actionKeywords)) {
+                if (text.includes(key)) {
+                    detectedActions.add(label);
+                }
+            }
+        });
+
+        // Build summary
+        let summary = `I see a <b>${pageType}</b>`;
+        if (title.length > 40) {
+            summary += ` called "${title.substring(0, 40)}..."`;
+        } else {
+            summary += ` called "${title}"`;
+        }
+
+        if (inputs.length > 0) {
+            summary += ` with ${inputs.length} input field${inputs.length > 1 ? 's' : ''}`;
+        }
+
+        if (detectedActions.size > 0) {
+            const mainAction = [...detectedActions][0];
+            summary += ` and a ${mainAction} action.`;
+        } else {
+            summary += '.';
+        }
+
+        return {
+            title,
+            pageType,
+            buttonCount: buttons.length,
+            inputCount: inputs.length,
+            linkCount: links.length,
+            formCount: forms.length,
+            actions: [...detectedActions].slice(0, 5), // Max 5 actions
+            summary
+        };
     }
 }
 
