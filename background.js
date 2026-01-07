@@ -2,34 +2,66 @@
 const GROQ_API_KEY = "YourGroqAPIKey"; // ⚠️ SECURE KEY
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
+// --- STORAGE MANAGER (Robust Fallback) ---
+const RAM_STORE = { agentState: null }; // Fallback if chrome.storage fails
+
+const Storage = {
+    async get(keys) {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+            return await chrome.storage.local.get(keys);
+        }
+        console.warn("Storage API missing. Using RAM fallback.");
+        return { agentState: RAM_STORE.agentState };
+    },
+    async set(items) {
+        try {
+            if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+                await chrome.storage.local.set(items);
+            }
+        } catch (e) {
+            console.warn("Storage write failed (non-fatal):", e);
+        }
+        // Always keep RAM fallback up‑to‑date
+        if (items.agentState !== undefined) RAM_STORE.agentState = items.agentState;
+    }
+};
 // --- ORCHESTRATOR & STATE MACHINE ---
 
 // Initialize State
 chrome.runtime.onInstalled.addListener(() => {
-    chrome.storage.local.set({ agentState: null });
+    Storage.set({ agentState: null });
 });
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.type === "ANALYZE_REQUEST") {
-        handleGoal(request.payload)
-            .then(sendResponse)
-            .catch(err => sendResponse({ error: true, message: err.message }));
-        return true;
-    }
-    if (request.type === "GET_STATE") {
-        chrome.storage.local.get(['agentState'], (result) => {
-            sendResponse(result.agentState);
-        });
-        return true;
-    }
-    if (request.type === "UPDATE_STEP") {
-        updateStep(request.payload).then(sendResponse);
-        return true;
-    }
-    if (request.type === "RESET_TASK") {
-        chrome.storage.local.set({ agentState: null }, () => sendResponse({ success: true }));
-        return true;
-    }
+    (async () => {
+        try {
+            // Ensure any storage operation never throws
+            // (Storage.set already catches its own errors)
+
+            if (request.type === "ANALYZE_REQUEST") {
+                const result = await handleGoal(request.payload);
+                sendResponse(result);
+            } else if (request.type === "GET_STATE") {
+                const result = await Storage.get(['agentState']);
+                sendResponse(result.agentState);
+            } else if (request.type === "UPDATE_STEP") {
+                await updateStep(request.payload);
+                sendResponse({ success: true });
+            } else if (request.type === "RESET_TASK") {
+                await Storage.set({ agentState: null });
+                sendResponse({ success: true });
+            } else {
+                // Unknown request – still reply to avoid channel closure
+                sendResponse({ error: true, message: "Unsupported request type." });
+            }
+        } catch (error) {
+            console.error("Background Message Handler Error:", error);
+            // Always reply, even on unexpected failures
+            sendResponse({ error: true, message: error.message || "Unknown background error" });
+        }
+    })();
+    // Must return true to keep the channel open for async reply
+    return true;
 });
 
 async function handleGoal(payload) {
@@ -43,40 +75,36 @@ async function handleGoal(payload) {
     // For now, let's assume we rely on the LLM to deduce context or add URL to snapshot in content.js later.
     // We will inject common patterns into the prompt context.
 
-    // --- 2. Advanced Prompt Engineering ---
+    // --- 2. Smart Guidance Prompt ---
     const systemPrompt = `
-You are the "Cortex", an elite AI Agentic UX Architect living inside the browser.
-Your goal is to navigate websites, automate tasks, and fill forms intelligently.
+You are a helpful browser assistant that guides users step-by-step to complete tasks on websites.
 
-### CAPABILITIES:
-1. **Analyze**: Read the DOM Snapshot (list of interactive elements).
-2. **Plan**: Create a logical, linear "Roadmap" of steps to achieve the User's Goal.
-3. **Reason**: Explain *why* you chose a specific element.
-4. **Predict**: If the user's intent is vague, suggest logical actions based on the page context.
+### YOUR JOB:
+1. Understand what the user wants to accomplish.
+2. Analyze the DOM SNAPSHOT - each element has a unique "id" field.
+3. Create steps that reference SPECIFIC elements from the snapshot.
+4. For EACH step, include the element's "id" so we can highlight it.
 
-### OUTPUT FORMAT (Strict JSON):
+### OUTPUT FORMAT (JSON):
 {
-  "thought_process": "Brief internal monologue analyzing the page state and user intent.",
   "roadmap": [
-    { 
-      "step_id": 1, 
-      "action": "click" | "type" | "navigate", 
-      "target_hint": "Visual description of element (e.g. 'Blue Sign In Button')", 
-      "reasoning": "Necessary to access account.",
-      "tool_invocations": [] 
+    {
+      "step_id": 1,
+      "action": "click" | "type" | "scroll" | "wait",
+      "target_id": "THE EXACT 'id' VALUE FROM THE SNAPSHOT (e.g., 'abc123')",
+      "target_hint": "Human-readable description (e.g., 'the First Name input field')",
+      "reasoning": "Brief explanation of why this step is needed"
     }
   ],
-  "immediate_target_id": "The exact 'data-agent-id' from the snapshot for the current step. NULL if not found.",
-  "guidance_text": "Conversational, short, and helpful message to the user.",
-  "suggested_actions": ["Quick Action 1", "Quick Action 2"],
-  "clarification_needed": boolean
+  "guidance_text": "Friendly message explaining the plan to the user",
+  "clarification_needed": false
 }
 
-### RULES:
-- **Precision**: Only select elements that explicitly exist in the Snapshot.
-- **Fail Gracefully**: If the target isn't visible, set "immediate_target_id" to null and explain in "guidance_text".
-- **Recovery**: If "isRecovery" is true, assume the previous plan failed. Re-scan and find an alternative path.
-- **Continuity**: If the User Goal is "Strictly find...", do NOT generate a new roadmap. Return the SAME roadmap but update the "immediate_target_id" for the active step.
+### CRITICAL RULES:
+- target_id MUST match an "id" from the DOM snapshot exactly
+- If you can't find a matching element, set target_id to null
+- Be specific in target_hint (describe by text, position, or appearance)
+- Maximum 10 steps per roadmap
 `;
 
     const userMessage = `
@@ -85,7 +113,7 @@ User Goal: "${userQuery || "What can I do here?"}"
 Status: ${isRecovery ? "⚠️ RECOVERY MODE (Previous step failed)" : "Standard Mode"}
 
 --- DOM SNAPSHOT (Interactive Elements) ---
-${JSON.stringify(domSnapshot).substring(0, 15000)} 
+${JSON.stringify(domSnapshot).substring(0, 10000)} 
 // Truncated to safe token limit
 `;
 
@@ -119,7 +147,7 @@ ${JSON.stringify(domSnapshot).substring(0, 15000)}
 
         const plan = JSON.parse(content);
 
-        // --- 4. State Persistence ---
+        // --- 4. Save State (via Robust Storage) ---
         const newState = {
             isActive: !plan.clarification_needed,
             goal: userQuery,
@@ -127,7 +155,7 @@ ${JSON.stringify(domSnapshot).substring(0, 15000)}
             currentStep: 0,
             lastUpdated: Date.now()
         };
-        await chrome.storage.local.set({ agentState: newState });
+        await Storage.set({ agentState: newState });
 
         return plan;
 
@@ -142,10 +170,10 @@ ${JSON.stringify(domSnapshot).substring(0, 15000)}
 }
 
 async function updateStep(index) {
-    const data = await chrome.storage.local.get(['agentState']);
+    const data = await Storage.get(['agentState']);
     if (data.agentState) {
         data.agentState.currentStep = index;
-        await chrome.storage.local.set({ agentState: data.agentState });
+        await Storage.set({ agentState: data.agentState });
     }
     return { success: true };
 }
