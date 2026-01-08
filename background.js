@@ -3,7 +3,7 @@ const GROQ_API_KEY = "YourGroqAPIKey"; // ⚠️ SECURE KEY
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 // --- STORAGE MANAGER (Robust Fallback) ---
-const RAM_STORE = { agentState: null }; // Fallback if chrome.storage fails
+const RAM_STORE = { agentState: null, savedTasks: {} }; // Fallback if chrome.storage fails
 
 const Storage = {
     async get(keys) {
@@ -23,6 +23,110 @@ const Storage = {
         }
         // Always keep RAM fallback up‑to‑date
         if (items.agentState !== undefined) RAM_STORE.agentState = items.agentState;
+    }
+};
+
+// --- TASK STORAGE (Persistent Multi-Step Memory) ---
+const TASK_STORAGE_KEY = 'agentic_saved_tasks';
+const TASK_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+const TaskStorage = {
+    // Save task state for an origin
+    async saveTaskState(origin, taskId, state) {
+        const allTasks = await this.getAllTasks();
+
+        if (!allTasks[origin]) {
+            allTasks[origin] = {};
+        }
+
+        allTasks[origin][taskId] = {
+            ...state,
+            savedAt: Date.now(),
+            lastUpdated: Date.now()
+        };
+
+        await this.setAllTasks(allTasks);
+        return { success: true, taskId };
+    },
+
+    // Get a specific task
+    async getTaskState(origin, taskId) {
+        const allTasks = await this.getAllTasks();
+        return allTasks[origin]?.[taskId] || null;
+    },
+
+    // List all active tasks for an origin
+    async listActiveTasks(origin) {
+        const allTasks = await this.getAllTasks();
+        const originTasks = allTasks[origin] || {};
+
+        return Object.entries(originTasks).map(([id, task]) => ({
+            id,
+            goal: task.goal,
+            currentStep: task.currentStep,
+            totalSteps: task.roadmap?.length || 0,
+            savedAt: task.savedAt
+        }));
+    },
+
+    // Delete a specific task
+    async deleteTask(origin, taskId) {
+        const allTasks = await this.getAllTasks();
+        if (allTasks[origin]?.[taskId]) {
+            delete allTasks[origin][taskId];
+            await this.setAllTasks(allTasks);
+            return { success: true };
+        }
+        return { success: false, message: 'Task not found' };
+    },
+
+    // Prune tasks older than 30 days
+    async pruneOldTasks() {
+        const allTasks = await this.getAllTasks();
+        const now = Date.now();
+        let pruned = 0;
+
+        for (const origin in allTasks) {
+            for (const taskId in allTasks[origin]) {
+                if (now - allTasks[origin][taskId].savedAt > TASK_MAX_AGE_MS) {
+                    delete allTasks[origin][taskId];
+                    pruned++;
+                }
+            }
+            // Clean up empty origins
+            if (Object.keys(allTasks[origin]).length === 0) {
+                delete allTasks[origin];
+            }
+        }
+
+        if (pruned > 0) {
+            await this.setAllTasks(allTasks);
+        }
+        return { pruned };
+    },
+
+    // Internal helpers
+    async getAllTasks() {
+        try {
+            if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+                const result = await chrome.storage.local.get([TASK_STORAGE_KEY]);
+                return result[TASK_STORAGE_KEY] || {};
+            }
+        } catch (e) {
+            console.warn("TaskStorage read failed:", e);
+        }
+        return RAM_STORE.savedTasks;
+    },
+
+    async setAllTasks(tasks) {
+        try {
+            if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+                await chrome.storage.local.set({ [TASK_STORAGE_KEY]: tasks });
+            }
+        } catch (e) {
+            console.warn("TaskStorage write failed:", e);
+        }
+        RAM_STORE.savedTasks = tasks;
     }
 };
 // --- ORCHESTRATOR & STATE MACHINE ---
@@ -50,6 +154,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             } else if (request.type === "RESET_TASK") {
                 await Storage.set({ agentState: null });
                 sendResponse({ success: true });
+            }
+            // --- TASK PERSISTENCE HANDLERS ---
+            else if (request.type === "SAVE_TASK") {
+                const { origin, taskId, state } = request.payload;
+                const result = await TaskStorage.saveTaskState(origin, taskId, state);
+                sendResponse(result);
+            } else if (request.type === "GET_SAVED_TASK") {
+                const { origin, taskId } = request.payload;
+                const result = await TaskStorage.getTaskState(origin, taskId);
+                sendResponse(result);
+            } else if (request.type === "LIST_SAVED_TASKS") {
+                const { origin } = request.payload;
+                const result = await TaskStorage.listActiveTasks(origin);
+                sendResponse(result);
+            } else if (request.type === "DELETE_SAVED_TASK") {
+                const { origin, taskId } = request.payload;
+                const result = await TaskStorage.deleteTask(origin, taskId);
+                sendResponse(result);
+            } else if (request.type === "PRUNE_OLD_TASKS") {
+                const result = await TaskStorage.pruneOldTasks();
+                sendResponse(result);
             } else {
                 // Unknown request – still reply to avoid channel closure
                 sendResponse({ error: true, message: "Unsupported request type." });
@@ -150,7 +275,7 @@ ${JSON.stringify(domSnapshot).substring(0, 10000)}
                 "Authorization": `Bearer ${GROQ_API_KEY}`
             },
             body: JSON.stringify({
-                model: "openai/gpt-oss-120b",
+                model: "llama-3.1-8b-instant",
                 messages: [
                     { role: "system", content: systemPrompt },
                     { role: "user", content: userMessage }
@@ -161,7 +286,11 @@ ${JSON.stringify(domSnapshot).substring(0, 10000)}
             })
         });
 
-        if (!response.ok) throw new Error(`Groq API Error: ${response.statusText}`);
+        if (!response.ok) {
+            const errorBody = await response.text();
+            console.error('Groq API Error Response:', errorBody);
+            throw new Error(`Groq API Error: ${response.status} - ${response.statusText || 'Request failed'} - ${errorBody.substring(0, 200)}`);
+        }
 
         const data = await response.json();
         let content = data.choices[0].message.content;
